@@ -1,6 +1,6 @@
 {
   "name": "@yc-tools/express-yc",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "CLI tool for deploying Express.js apps to Yandex Cloud",
   "license": "MIT",
   "author": "yc-tools Contributors",

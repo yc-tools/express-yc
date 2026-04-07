@@ -24,6 +24,9 @@ export interface BuildOptions {
   containerTarget?: ContainerTarget;
   region?: string;
   registryId?: string;
+  externalPackages?: string[];
+  routePrefixDepth?: number;
+  entries?: Record<string, string>;
   verbose?: boolean;
 }
 
@@ -36,6 +39,9 @@ export class Builder {
       routing = 'single',
       containerTarget = 'serverless-containers',
       region = 'ru-central1',
+      externalPackages,
+      routePrefixDepth,
+      entries,
       verbose,
     } = options;
 
@@ -64,6 +70,9 @@ export class Builder {
         buildId,
         appName,
         region,
+        externalPackages,
+        routePrefixDepth,
+        entries,
         verbose,
         spinner,
       });
@@ -101,19 +110,27 @@ export class Builder {
     buildId: string;
     appName: string;
     region: string;
+    externalPackages?: string[];
+    routePrefixDepth?: number;
+    entries?: Record<string, string>;
     verbose?: boolean;
     spinner: ReturnType<typeof ora>;
   }): Promise<DeployManifest> {
-    const { projectPath, artifactsDir, capabilities, routing, buildId, appName, region, verbose, spinner } = opts;
+    const { projectPath, artifactsDir, capabilities, routing, buildId, appName, region, externalPackages, routePrefixDepth, entries, verbose, spinner } = opts;
+
+    if (entries && Object.keys(entries).length > 0) {
+      return this.buildFromEntries({ ...opts, entries });
+    }
 
     if (routing === 'single') {
-      return this.buildSingleFunction(opts);
+      return this.buildSingleFunction({ ...opts, externalPackages });
     }
 
     // Per-route mode: create one function per route group
     spinner.start('Building per-route serverless functions...');
 
-    const routeGroups = this.groupRoutes(capabilities.routes);
+    const externals = externalPackages ?? [];
+    const routeGroups = this.groupRoutes(capabilities.routes, routePrefixDepth ?? 1);
     const functions: FunctionArtifact[] = [];
     const tempDir = path.join(opts.outputDir, '.tmp-build');
     await fs.ensureDir(tempDir);
@@ -143,9 +160,14 @@ export class Builder {
           minify: true,
           treeShaking: true,
           logLevel: 'warning',
+          external: externals,
         });
 
-        await this.zipFile(distPath, zipPath, 'index.js');
+        if (externals.length > 0) {
+          await this.zipBundleWithNodeModules(distPath, projectPath, externals, zipPath);
+        } else {
+          await this.zipFile(distPath, zipPath, 'index.js');
+        }
 
         functions.push({
           name: funcName,
@@ -199,10 +221,11 @@ export class Builder {
     buildId: string;
     appName: string;
     region: string;
+    externalPackages?: string[];
     verbose?: boolean;
     spinner: ReturnType<typeof ora>;
   }): Promise<DeployManifest> {
-    const { projectPath, outputDir, artifactsDir, capabilities, buildId, appName, region, verbose, spinner } = opts;
+    const { projectPath, outputDir, artifactsDir, capabilities, buildId, appName, region, externalPackages, verbose, spinner } = opts;
 
     spinner.start('Bundling Express app (single function)...');
 
@@ -215,6 +238,8 @@ export class Builder {
     const wrapperPath = path.join(tempDir, 'entry.cjs');
     const distPath = path.join(tempDir, 'bundle.cjs');
     const zipPath = path.join(artifactsDir, 'function.zip');
+
+    const externals = externalPackages ?? [];
 
     try {
       const wrapperCode = this.generateFunctionWrapper(entryForWrapper);
@@ -230,9 +255,14 @@ export class Builder {
         minify: true,
         treeShaking: true,
         logLevel: 'warning',
+        external: externals,
       });
 
-      await this.zipFile(distPath, zipPath, 'index.js');
+      if (externals.length > 0) {
+        await this.zipBundleWithNodeModules(distPath, projectPath, externals, zipPath);
+      } else {
+        await this.zipFile(distPath, zipPath, 'index.js');
+      }
     } finally {
       await fs.remove(tempDir);
     }
@@ -268,6 +298,88 @@ export class Builder {
         functions: [funcArtifact],
         openApiPath: path.relative(outputDir, openApiPath),
       },
+    };
+  }
+
+  private async buildFromEntries(opts: {
+    projectPath: string;
+    outputDir: string;
+    artifactsDir: string;
+    capabilities: ExpressCapabilities;
+    entries: Record<string, string>;
+    buildId: string;
+    appName: string;
+    region: string;
+    externalPackages?: string[];
+    verbose?: boolean;
+    spinner: ReturnType<typeof ora>;
+  }): Promise<DeployManifest> {
+    const { projectPath, artifactsDir, entries, buildId, appName, region, externalPackages, verbose, spinner } = opts;
+
+    spinner.start('Building native serverless handlers...');
+
+    const externals = externalPackages ?? [];
+    const functions: FunctionArtifact[] = [];
+    const tempDir = path.join(opts.outputDir, '.tmp-build');
+    await fs.ensureDir(tempDir);
+
+    try {
+      for (const [name, entryRelative] of Object.entries(entries)) {
+        const entryAbsolute = path.resolve(projectPath, entryRelative);
+        const distPath = path.join(tempDir, `${name}-bundle.cjs`);
+        const zipPath = path.join(artifactsDir, `${name}.zip`);
+
+        await esbuild.build({
+          entryPoints: [entryAbsolute],
+          bundle: true,
+          platform: 'node',
+          target: 'node20',
+          format: 'cjs',
+          outfile: distPath,
+          minify: true,
+          treeShaking: true,
+          logLevel: 'warning',
+          external: externals,
+        });
+
+        if (externals.length > 0) {
+          await this.zipBundleWithNodeModules(distPath, projectPath, externals, zipPath);
+        } else {
+          await this.zipFile(distPath, zipPath, 'index.js');
+        }
+
+        functions.push({
+          name,
+          zipPath: path.relative(opts.outputDir, zipPath),
+          entry: 'index.handler',
+          memory: 256,
+          timeout: 30,
+          env: { NODE_ENV: 'production' },
+        });
+
+        if (verbose) {
+          console.log(chalk.gray(`  Built handler: ${name} ← ${entryRelative}`));
+        }
+      }
+    } finally {
+      await fs.remove(tempDir);
+    }
+
+    spinner.succeed(`Built ${functions.length} native handlers`);
+
+    return {
+      schemaVersion: '1.0',
+      buildId,
+      timestamp: new Date().toISOString(),
+      expressVersion: opts.capabilities.expressVersion,
+      appName,
+      capabilities: opts.capabilities,
+      deployment: {
+        mode: 'serverless',
+        routing: 'per-route',
+        region,
+      },
+      artifacts: { functions },
     };
   }
 
@@ -402,16 +514,17 @@ exports.handler = async (event, context) => {
 
   private groupRoutes(
     routes: Array<{ method: string; path: string }>,
+    depth = 1,
   ): Array<{ prefix: string; routes: Array<{ method: string; path: string }> }> {
     if (routes.length === 0) {
       return [{ prefix: 'app', routes: [] }];
     }
 
-    // Group routes by their top-level prefix (e.g. /api/users → /api)
+    // Group routes by their top-level prefix segments (depth controls how many)
     const groups = new Map<string, Array<{ method: string; path: string }>>();
     for (const route of routes) {
       const parts = route.path.split('/').filter(Boolean);
-      const prefix = parts.length > 0 ? `/${parts[0]}` : '/';
+      const prefix = parts.length > 0 ? '/' + parts.slice(0, depth).join('/') : '/';
       const existing = groups.get(prefix) || [];
       existing.push(route);
       groups.set(prefix, existing);
@@ -434,6 +547,31 @@ exports.handler = async (event, context) => {
 
       archive.pipe(output);
       archive.file(sourcePath, { name: entryName });
+      void archive.finalize();
+    });
+  }
+
+  private async zipBundleWithNodeModules(
+    bundlePath: string,
+    projectPath: string,
+    externals: string[],
+    destZip: string,
+  ): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const output = fs.createWriteStream(destZip);
+      const archive = archiver('zip', { zlib: { level: 9 } });
+
+      output.on('close', resolve);
+      archive.on('error', reject);
+
+      archive.pipe(output);
+      archive.file(bundlePath, { name: 'index.js' });
+
+      for (const pkg of externals) {
+        const pkgDir = path.join(projectPath, 'node_modules', pkg);
+        archive.directory(pkgDir, `node_modules/${pkg}`);
+      }
+
       void archive.finalize();
     });
   }

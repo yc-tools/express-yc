@@ -30,7 +30,7 @@ const program = new Command();
 program
   .name('express-yc')
   .description('CLI tool for deploying Express.js applications to Yandex Cloud')
-  .version('1.0.0');
+  .version('1.0.2');
 
 function cliOptionValue<T>(command: Command, name: string, value: T): T | undefined {
   return command.getOptionValueSource(name) === 'cli' ? value : undefined;
@@ -199,6 +199,13 @@ program
   .option('--routing <routing>', 'Routing mode (serverless only): single | per-route', 'single')
   .option('--container-target <target>', 'Container target: serverless-containers | instance-group', 'serverless-containers')
   .option('--registry-id <id>', 'Yandex Container Registry ID (for container mode)')
+  .option(
+    '--external <pkg>',
+    'Mark package as external in bundle, copy from node_modules (repeatable)',
+    (val: string, acc: string[]) => { acc.push(val); return acc; },
+    [] as string[],
+  )
+  .option('--route-depth <n>', 'Number of path segments used for per-route grouping', '1')
   .option('-b, --build-id <id>', 'Custom build ID')
   .option('-v, --verbose', 'Verbose output')
   .action(async (options) => {
@@ -216,6 +223,8 @@ program
         routing: options.routing as RoutingMode,
         containerTarget: options.containerTarget as ContainerTarget,
         registryId: options.registryId as string | undefined,
+        externalPackages: (options.external as string[]).length > 0 ? options.external as string[] : undefined,
+        routePrefixDepth: options.routeDepth ? parseInt(options.routeDepth as string, 10) : undefined,
         verbose: options.verbose as boolean | undefined,
       });
 
@@ -477,6 +486,22 @@ program
           getConfigString(mergedConfig, 'appName'),
         );
 
+        const configExternals = Array.isArray(mergedConfig['externalPackages'])
+          ? (mergedConfig['externalPackages'] as unknown[]).filter((x): x is string => typeof x === 'string')
+          : [];
+        const configRouteDepth = typeof mergedConfig['routePrefixDepth'] === 'number'
+          ? (mergedConfig['routePrefixDepth'] as number)
+          : undefined;
+        const configEntries = (() => {
+          const val = mergedConfig['entries'];
+          if (typeof val !== 'object' || val === null || Array.isArray(val)) return undefined;
+          const result: Record<string, string> = {};
+          for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+            if (typeof v === 'string') result[k] = v;
+          }
+          return Object.keys(result).length > 0 ? result : undefined;
+        })();
+
         await builder.build({
           projectPath,
           outputDir,
@@ -495,6 +520,9 @@ program
             getConfigString(mergedConfig, 'registryId'),
           ),
           region: deployRegion,
+          externalPackages: configExternals.length > 0 ? configExternals : undefined,
+          routePrefixDepth: configRouteDepth,
+          entries: configEntries,
           verbose: options.verbose as boolean | undefined,
         });
 

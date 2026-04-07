@@ -1,6 +1,7 @@
 import fs from 'fs-extra';
 import path from 'path';
 import chalk from 'chalk';
+import { glob } from 'glob';
 
 export interface RouteInfo {
   method: string;
@@ -52,8 +53,8 @@ export class Analyzer {
     const isTypeScript =
       entryFile.endsWith('.ts') || (await fs.pathExists(path.join(projectPath, 'tsconfig.json')));
 
-    // Detect routes from entry file
-    const routes = await this.extractRoutes(path.join(projectPath, entryFile), verbose);
+    // Detect routes from all source files
+    const routes = await this.extractAllRoutes(projectPath, entryFile, verbose);
     if (verbose) {
       console.log(chalk.gray(`  Routes detected: ${routes.length}`));
     }
@@ -148,6 +149,40 @@ export class Analyzer {
     throw new Error(
       'Could not detect Express entry file. Set "main" in package.json or use a standard file name (index.ts, app.ts, server.ts).',
     );
+  }
+
+  private async extractAllRoutes(
+    projectPath: string,
+    entryFile: string,
+    verbose?: boolean,
+  ): Promise<RouteInfo[]> {
+    const files = await glob(['src/**/*.ts', 'src/**/*.js'], {
+      cwd: projectPath,
+      ignore: ['**/*.d.ts'],
+      absolute: true,
+    });
+
+    // Include entry file if it's outside src/
+    const entryAbsolute = path.resolve(projectPath, entryFile);
+    if (!files.includes(entryAbsolute) && (await fs.pathExists(entryAbsolute))) {
+      files.push(entryAbsolute);
+    }
+
+    const seen = new Set<string>();
+    const routes: RouteInfo[] = [];
+
+    for (const file of files) {
+      const fileRoutes = await this.extractRoutes(file, verbose);
+      for (const route of fileRoutes) {
+        const key = `${route.method}:${route.path}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          routes.push(route);
+        }
+      }
+    }
+
+    return routes;
   }
 
   private async extractRoutes(entryFilePath: string, verbose?: boolean): Promise<RouteInfo[]> {
