@@ -1,0 +1,44 @@
+{
+  "name": "@yc-tools/express-yc-runtime",
+  "version": "1.0.0",
+  "description": "Runtime adapter for Express.js on Yandex Cloud Functions",
+  "license": "MIT",
+  "author": "yc-tools Contributors",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yc-tools/express-yc.git",
+    "directory": "packages/express-yc-runtime"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org",
+    "access": "public"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "serverless-http": "^3.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
