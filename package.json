@@ -15,8 +15,8 @@
     "setup": "pnpm install && pnpm build"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
-    "typescript": "^5.3.3"
+    "@types/node": "^25.5.2",
+    "typescript": "^6.0.2"
   },
   "engines": {
     "node": ">=20.0.0",
