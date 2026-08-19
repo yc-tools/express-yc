@@ -11,6 +11,8 @@ export interface UploadOptions {
   bucket: string;
   region?: string;
   endpoint?: string;
+  accessKeyId?: string;
+  secretAccessKey?: string;
   verbose?: boolean;
   dryRun?: boolean;
 }
@@ -25,11 +27,25 @@ export class Uploader {
       bucket,
       region = 'ru-central1',
       endpoint = 'https://storage.yandexcloud.net',
+      accessKeyId,
+      secretAccessKey,
       verbose,
       dryRun,
     } = options;
 
-    this.s3Client = new S3Client({ region, endpoint });
+    if (!dryRun && (!accessKeyId || !secretAccessKey)) {
+      throw new Error(
+        'Object Storage credentials are required for upload. Set EYC_STORAGE_ACCESS_KEY/EYC_STORAGE_SECRET_KEY (or YC_ACCESS_KEY/YC_SECRET_KEY, AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY), or config "storageAccessKey"/"storageSecretKey".',
+      );
+    }
+
+    this.s3Client = new S3Client({
+      region,
+      endpoint,
+      ...(accessKeyId && secretAccessKey
+        ? { credentials: { accessKeyId, secretAccessKey } }
+        : {}),
+    });
 
     if (!(await fs.pathExists(buildDir))) {
       throw new Error(`Build directory not found: ${buildDir}`);

@@ -162,6 +162,27 @@ export function parseBoolean(value: unknown): boolean | undefined {
   return undefined;
 }
 
+// Mirrors the terraform app_name validation in project/*/variables.tf.
+export const APP_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{1,29}[a-z0-9]$/;
+
+export function sanitizeAppName(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+export function resolveAppName(raw: string): string {
+  const name = sanitizeAppName(raw);
+  if (!APP_NAME_PATTERN.test(name)) {
+    throw new Error(
+      `Invalid app name "${raw}"${name !== raw ? ` (sanitized: "${name}")` : ''}: must be 3-31 lowercase alphanumeric characters or hyphens. Provide --app-name (or EYC_APP_NAME / config "appName").`,
+    );
+  }
+  return name;
+}
+
 export function firstDefined<T>(...values: Array<T | undefined>): T | undefined {
   for (const value of values) {
     if (value !== undefined) {

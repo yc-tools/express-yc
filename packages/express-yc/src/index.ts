@@ -22,6 +22,7 @@ import {
   getEnvBoolean,
   getEnvString,
   loadExpressYcConfig,
+  resolveAppName,
 } from './config/index.js';
 import type { DeploymentMode, RoutingMode, ContainerTarget } from './build/index.js';
 
@@ -31,6 +32,31 @@ program
   .name('express-yc')
   .description('CLI tool for deploying Express.js applications to Yandex Cloud')
   .version('1.0.2');
+
+const DEPLOYMENT_MODES: readonly DeploymentMode[] = ['serverless', 'container'];
+const ROUTING_MODES: readonly RoutingMode[] = ['single', 'per-route'];
+const CONTAINER_TARGETS: readonly ContainerTarget[] = ['serverless-containers', 'instance-group'];
+// Mirrors the terraform env validation in project/*/variables.tf.
+const ENVIRONMENTS = ['dev', 'staging', 'production'] as const;
+
+function parseChoice<T extends string>(
+  value: string,
+  optionName: string,
+  allowed: readonly T[],
+): T {
+  if ((allowed as readonly string[]).includes(value)) {
+    return value as T;
+  }
+  throw new Error(`Invalid ${optionName} value "${value}". Allowed values: ${allowed.join(', ')}.`);
+}
+
+function parsePositiveInt(value: string, optionName: string): number {
+  const parsed = parseInt(value, 10);
+  if (!Number.isInteger(parsed) || parsed <= 0 || String(parsed) !== value.trim()) {
+    throw new Error(`Invalid ${optionName} value "${value}". Expected a positive integer.`);
+  }
+  return parsed;
+}
 
 function cliOptionValue<T>(command: Command, name: string, value: T): T | undefined {
   return command.getOptionValueSource(name) === 'cli' ? value : undefined;
@@ -98,6 +124,7 @@ function buildTerraformVarEnv(options: {
   createDnsZone?: boolean;
   storageAccessKey?: string;
   storageSecretKey?: string;
+  deployBucketName?: string;
   tfVarAssignments?: Record<string, string>;
   envTfVars?: Record<string, string>;
   configTfVars?: Record<string, string>;
@@ -118,6 +145,7 @@ function buildTerraformVarEnv(options: {
     ['create_dns_zone', options.createDnsZone],
     ['storage_access_key', options.storageAccessKey],
     ['storage_secret_key', options.storageSecretKey],
+    ['deploy_bucket_name', options.deployBucketName],
   ]);
 
   for (const [key, value] of mapped.entries()) {
@@ -219,12 +247,19 @@ program
         outputDir,
         appName: options.appName as string | undefined,
         buildId: options.buildId as string | undefined,
-        mode: options.mode as DeploymentMode,
-        routing: options.routing as RoutingMode,
-        containerTarget: options.containerTarget as ContainerTarget,
+        mode: parseChoice(options.mode as string, '--mode', DEPLOYMENT_MODES),
+        routing: parseChoice(options.routing as string, '--routing', ROUTING_MODES),
+        containerTarget: parseChoice(
+          options.containerTarget as string,
+          '--container-target',
+          CONTAINER_TARGETS,
+        ),
         registryId: options.registryId as string | undefined,
         externalPackages: (options.external as string[]).length > 0 ? options.external as string[] : undefined,
-        routePrefixDepth: options.routeDepth ? parseInt(options.routeDepth as string, 10) : undefined,
+        routePrefixDepth: options.routeDepth
+          ? parsePositiveInt(options.routeDepth as string, '--route-depth')
+          : undefined,
+        envVars: collectCustomEnvVars(process.env),
         verbose: options.verbose as boolean | undefined,
       });
 
@@ -259,6 +294,16 @@ program
         bucket: options.bucket as string,
         region: options.region as string,
         endpoint: options.endpoint as string | undefined,
+        accessKeyId: firstDefined(
+          getEnvString(process.env, 'EYC_STORAGE_ACCESS_KEY'),
+          getEnvString(process.env, 'YC_ACCESS_KEY'),
+          getEnvString(process.env, 'AWS_ACCESS_KEY_ID'),
+        ),
+        secretAccessKey: firstDefined(
+          getEnvString(process.env, 'EYC_STORAGE_SECRET_KEY'),
+          getEnvString(process.env, 'YC_SECRET_KEY'),
+          getEnvString(process.env, 'AWS_SECRET_ACCESS_KEY'),
+        ),
         verbose: options.verbose as boolean | undefined,
         dryRun: options.dryRun as boolean | undefined,
       });
@@ -388,24 +433,36 @@ program
           './build',
         ) as string,
       );
-      const deployMode = firstDefined(
-        cliOptionValue(command, 'mode', options.mode as string | undefined),
-        getEnvString(env, 'EYC_MODE'),
-        getConfigString(mergedConfig, 'mode'),
-        'serverless',
-      ) as DeploymentMode;
-      const deployRouting = firstDefined(
-        cliOptionValue(command, 'routing', options.routing as string | undefined),
-        getEnvString(env, 'EYC_ROUTING'),
-        getConfigString(mergedConfig, 'routing'),
-        'single',
-      ) as RoutingMode;
-      const containerTarget = firstDefined(
-        cliOptionValue(command, 'containerTarget', options.containerTarget as string | undefined),
-        getEnvString(env, 'EYC_CONTAINER_TARGET'),
-        getConfigString(mergedConfig, 'containerTarget'),
-        'serverless-containers',
-      ) as ContainerTarget;
+      const deployMode = parseChoice(
+        firstDefined(
+          cliOptionValue(command, 'mode', options.mode as string | undefined),
+          getEnvString(env, 'EYC_MODE'),
+          getConfigString(mergedConfig, 'mode'),
+          'serverless',
+        ) as string,
+        '--mode',
+        DEPLOYMENT_MODES,
+      );
+      const deployRouting = parseChoice(
+        firstDefined(
+          cliOptionValue(command, 'routing', options.routing as string | undefined),
+          getEnvString(env, 'EYC_ROUTING'),
+          getConfigString(mergedConfig, 'routing'),
+          'single',
+        ) as string,
+        '--routing',
+        ROUTING_MODES,
+      );
+      const containerTarget = parseChoice(
+        firstDefined(
+          cliOptionValue(command, 'containerTarget', options.containerTarget as string | undefined),
+          getEnvString(env, 'EYC_CONTAINER_TARGET'),
+          getConfigString(mergedConfig, 'containerTarget'),
+          'serverless-containers',
+        ) as string,
+        '--container-target',
+        CONTAINER_TARGETS,
+      );
       const deployRegion = firstDefined(
         cliOptionValue(command, 'region', options.region as string | undefined),
         getEnvString(env, 'EYC_REGION'),
@@ -426,6 +483,21 @@ program
         const builder = new Builder();
         const uploader = new Uploader();
         const terraform = new TerraformRunner(terraformDir);
+
+        // Single credential chain for Object Storage — used by the terraform
+        // backend and by the artifact uploader.
+        const storageAccessKey = firstDefined(
+          getEnvString(env, 'EYC_STORAGE_ACCESS_KEY'),
+          getConfigString(mergedConfig, 'storageAccessKey'),
+          getEnvString(env, 'YC_ACCESS_KEY'),
+          getEnvString(env, 'AWS_ACCESS_KEY_ID'),
+        );
+        const storageSecretKey = firstDefined(
+          getEnvString(env, 'EYC_STORAGE_SECRET_KEY'),
+          getConfigString(mergedConfig, 'storageSecretKey'),
+          getEnvString(env, 'YC_SECRET_KEY'),
+          getEnvString(env, 'AWS_SECRET_ACCESS_KEY'),
+        );
 
         const backend = resolveBackendConfig(
           buildBackendInput({
@@ -464,26 +536,42 @@ program
           {
             ...env,
             YC_REGION: firstDefined(getEnvString(env, 'YC_REGION'), deployRegion),
-            YC_ACCESS_KEY: firstDefined(
-              getEnvString(env, 'EYC_STORAGE_ACCESS_KEY'),
-              getConfigString(mergedConfig, 'storageAccessKey'),
-              getEnvString(env, 'YC_ACCESS_KEY'),
-            ),
-            YC_SECRET_KEY: firstDefined(
-              getEnvString(env, 'EYC_STORAGE_SECRET_KEY'),
-              getConfigString(mergedConfig, 'storageSecretKey'),
-              getEnvString(env, 'YC_SECRET_KEY'),
-            ),
+            YC_ACCESS_KEY: storageAccessKey,
+            YC_SECRET_KEY: storageSecretKey,
           },
         );
 
-        await terraform.init(backend || undefined);
+        // The embedded terraform templates use an s3 backend; without state
+        // configuration `terraform init` fails with a cryptic prompt.
+        if (!backend) {
+          throw new Error(
+            'Terraform state backend is not configured. Set EYC_STATE_BUCKET and EYC_STATE_KEY ' +
+              '(or --state-bucket/--state-key, or config "stateBucket"/"stateKey"), plus storage credentials via ' +
+              'EYC_STORAGE_ACCESS_KEY/EYC_STORAGE_SECRET_KEY (or YC_ACCESS_KEY/YC_SECRET_KEY).',
+          );
+        }
 
-        // Build
-        const appName = firstDefined(
-          cliOptionValue(command, 'appName', options.appName as string | undefined),
-          getEnvString(env, 'EYC_APP_NAME'),
-          getConfigString(mergedConfig, 'appName'),
+        await terraform.init(backend);
+
+        // Resolve and validate app name / environment early — both feed the
+        // terraform variable validations and the default deploy bucket name.
+        const appName = resolveAppName(
+          firstDefined(
+            cliOptionValue(command, 'appName', options.appName as string | undefined),
+            getEnvString(env, 'EYC_APP_NAME'),
+            getConfigString(mergedConfig, 'appName'),
+            path.basename(projectPath),
+          ) as string,
+        );
+        const environment = parseChoice(
+          firstDefined(
+            cliOptionValue(command, 'environment', options.environment as string | undefined),
+            getEnvString(env, 'EYC_ENV'),
+            getConfigString(mergedConfig, 'environment'),
+            'production',
+          ) as string,
+          '--environment',
+          ENVIRONMENTS,
         );
 
         const configExternals = Array.isArray(mergedConfig['externalPackages'])
@@ -501,6 +589,13 @@ program
           }
           return Object.keys(result).length > 0 ? result : undefined;
         })();
+
+        // Custom env vars (EYC_ENV_*) are injected into the function/container
+        // environment through the manifest.
+        const customEnv = collectCustomEnvVars(env);
+        if (Object.keys(customEnv).length > 0 && options.verbose) {
+          console.log(chalk.gray(`  Custom env vars: ${Object.keys(customEnv).join(', ')}`));
+        }
 
         await builder.build({
           projectPath,
@@ -523,48 +618,22 @@ program
           externalPackages: configExternals.length > 0 ? configExternals : undefined,
           routePrefixDepth: configRouteDepth,
           entries: configEntries,
+          envVars: customEnv,
           verbose: options.verbose as boolean | undefined,
         });
 
-        // Inject custom env vars into manifest
-        const customEnv = collectCustomEnvVars(env);
-        if (Object.keys(customEnv).length > 0 && options.verbose) {
-          console.log(chalk.gray(`  Custom env vars: ${Object.keys(customEnv).join(', ')}`));
-        }
+        // Terraform variables + apply environment. Built before upload: a
+        // fresh stack needs a targeted apply to create the deploy bucket.
+        const explicitBucket = firstDefined(
+          cliOptionValue(command, 'bucket', options.bucket as string | undefined),
+          getEnvString(env, 'EYC_BUCKET'),
+          getConfigString(mergedConfig, 'bucket'),
+        );
 
-        // Upload (serverless only)
-        if (deployMode === 'serverless') {
-          const outputs = await terraform.readOutputs();
-          const explicitBucket = firstDefined(
-            cliOptionValue(command, 'bucket', options.bucket as string | undefined),
-            getEnvString(env, 'EYC_BUCKET'),
-            getConfigString(mergedConfig, 'bucket'),
-          );
-          const deployBucket = explicitBucket || extractOutputString(outputs, 'deploy_bucket');
-
-          if (!deployBucket) {
-            throw new Error(
-              'Artifacts bucket is required for upload. Provide --bucket or set EYC_BUCKET.',
-            );
-          }
-
-          await uploader.upload({
-            buildDir: outputDir,
-            bucket: deployBucket,
-            region: deployRegion,
-            endpoint: deployEndpoint,
-            verbose: options.verbose as boolean | undefined,
-          });
-        }
-
-        // Terraform apply
         const terraformVarEnv = buildTerraformVarEnv({
           appName,
-          environment: firstDefined(
-            cliOptionValue(command, 'environment', options.environment as string | undefined),
-            getEnvString(env, 'EYC_ENV'),
-            getConfigString(mergedConfig, 'environment'),
-          ),
+          environment,
+          deployBucketName: explicitBucket,
           domainName: firstDefined(
             cliOptionValue(command, 'domainName', options.domainName as string | undefined),
             getEnvString(env, 'EYC_DOMAIN_NAME'),
@@ -630,6 +699,48 @@ program
           TF_VAR_manifest_path: path.join(outputDir, 'deploy.manifest.json'),
           TF_VAR_build_dir: outputDir,
         };
+
+        // Validate required provider settings up front — terraform would
+        // otherwise stop on interactive variable prompts (EOF errors in CI).
+        const missingSettings: string[] = [];
+        if (!applyEnv['TF_VAR_cloud_id']) missingSettings.push('cloud_id (EYC_CLOUD_ID or config "cloudId")');
+        if (!applyEnv['TF_VAR_folder_id']) missingSettings.push('folder_id (EYC_FOLDER_ID or config "folderId")');
+        if (!applyEnv['TF_VAR_iam_token']) missingSettings.push('iam_token (EYC_IAM_TOKEN or config "iamToken")');
+        if (missingSettings.length > 0) {
+          throw new Error(`Missing required Yandex Cloud settings: ${missingSettings.join('; ')}.`);
+        }
+
+        // Upload (serverless only)
+        if (deployMode === 'serverless') {
+          const outputs = await terraform.readOutputs();
+          let deployBucket = explicitBucket || extractOutputString(outputs, 'deploy_bucket');
+
+          if (!deployBucket) {
+            // Fresh stack: the deploy bucket is created by terraform, but the
+            // artifacts must be uploaded before the functions can be applied.
+            // Compute the default bucket name the same way the template does
+            // (<app>-<env>-deploy) and create just the bucket first.
+            deployBucket = `${appName}-${environment}-deploy`;
+            console.log(
+              chalk.gray(`  No deploy bucket in terraform outputs; creating ${deployBucket}...`),
+            );
+            await terraform.apply({
+              targets: ['yandex_storage_bucket.deploy'],
+              autoApprove,
+              env: applyEnv,
+            });
+          }
+
+          await uploader.upload({
+            buildDir: outputDir,
+            bucket: deployBucket,
+            region: deployRegion,
+            endpoint: deployEndpoint,
+            accessKeyId: storageAccessKey,
+            secretAccessKey: storageSecretKey,
+            verbose: options.verbose as boolean | undefined,
+          });
+        }
 
         await terraform.apply({ autoApprove, env: applyEnv });
 
