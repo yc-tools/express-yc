@@ -101,6 +101,8 @@ export async function cleanupTerraformProject(terraformDir: string): Promise<voi
 }
 
 export class TerraformRunner {
+  private backendEnv: NodeJS.ProcessEnv = {};
+
   constructor(
     private readonly terraformDir: string,
     private readonly terraformBin: string = 'terraform',
@@ -118,8 +120,13 @@ export class TerraformRunner {
       args.push('-backend-config=skip_credentials_validation=true');
       args.push('-backend-config=skip_metadata_api_check=true');
       args.push('-backend-config=skip_requesting_account_id=true');
-      args.push(`-backend-config=access_key=${backend.accessKey}`);
-      args.push(`-backend-config=secret_key=${backend.secretKey}`);
+      // Backend credentials go through the environment (the s3 backend reads
+      // AWS_* variables) instead of argv, so they are not visible in `ps`.
+      // They are kept for every subsequent command that touches remote state.
+      this.backendEnv = {
+        AWS_ACCESS_KEY_ID: backend.accessKey,
+        AWS_SECRET_ACCESS_KEY: backend.secretKey,
+      };
     }
 
     await this.run(args, { env });
@@ -130,6 +137,10 @@ export class TerraformRunner {
 
     if (options.autoApprove) {
       args.push('-auto-approve');
+    } else if (!process.stdin.isTTY) {
+      throw new Error(
+        'terraform apply requires an interactive terminal to confirm the plan. Pass --auto-approve (or set EYC_AUTO_APPROVE=1) when running non-interactively.',
+      );
     }
 
     if (options.refresh === false) {
@@ -198,8 +209,10 @@ export class TerraformRunner {
     return new Promise((resolve, reject) => {
       const child = spawn(this.terraformBin, args, {
         cwd: this.terraformDir,
-        env: { ...process.env, ...options.env },
-        stdio: 'pipe',
+        env: { ...process.env, ...this.backendEnv, ...options.env },
+        // Inherit stdin when streaming output so interactive prompts
+        // (e.g. terraform apply confirmation) actually work.
+        stdio: captureOutput ? 'pipe' : ['inherit', 'pipe', 'pipe'],
       });
 
       let stdout = '';

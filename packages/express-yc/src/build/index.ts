@@ -1,12 +1,15 @@
 import fs from 'fs-extra';
 import path from 'path';
-import { execSync, spawn } from 'child_process';
+import { spawn } from 'child_process';
+import { createHash } from 'crypto';
+import { createRequire } from 'module';
 import archiver from 'archiver';
 import chalk from 'chalk';
 import ora from 'ora';
 import * as esbuild from 'esbuild';
 import { Analyzer } from '../analyze/index.js';
 import { writeManifest, generateBuildId } from '../manifest/index.js';
+import { resolveAppName } from '../config/index.js';
 import type { DeployManifest, FunctionArtifact } from '../manifest/schema.js';
 import type { ExpressCapabilities } from '../analyze/index.js';
 
@@ -27,6 +30,8 @@ export interface BuildOptions {
   externalPackages?: string[];
   routePrefixDepth?: number;
   entries?: Record<string, string>;
+  /** Extra environment variables injected into every function/container (EYC_ENV_*). */
+  envVars?: Record<string, string>;
   verbose?: boolean;
 }
 
@@ -42,6 +47,7 @@ export class Builder {
       externalPackages,
       routePrefixDepth,
       entries,
+      envVars,
       verbose,
     } = options;
 
@@ -56,7 +62,7 @@ export class Builder {
     spinner.succeed(`Express ${capabilities.expressVersion} detected`);
 
     const buildId = options.buildId || generateBuildId();
-    const appName = options.appName || path.basename(projectPath);
+    const appName = resolveAppName(options.appName || path.basename(projectPath));
 
     let manifest: DeployManifest;
 
@@ -73,6 +79,7 @@ export class Builder {
         externalPackages,
         routePrefixDepth,
         entries,
+        envVars,
         verbose,
         spinner,
       });
@@ -87,6 +94,7 @@ export class Builder {
         appName,
         region,
         registryId: options.registryId,
+        envVars,
         verbose,
         spinner,
       });
@@ -113,10 +121,11 @@ export class Builder {
     externalPackages?: string[];
     routePrefixDepth?: number;
     entries?: Record<string, string>;
+    envVars?: Record<string, string>;
     verbose?: boolean;
     spinner: ReturnType<typeof ora>;
   }): Promise<DeployManifest> {
-    const { projectPath, artifactsDir, capabilities, routing, buildId, appName, region, externalPackages, routePrefixDepth, entries, verbose, spinner } = opts;
+    const { projectPath, artifactsDir, capabilities, routing, buildId, appName, region, externalPackages, routePrefixDepth, entries, envVars, verbose, spinner } = opts;
 
     if (entries && Object.keys(entries).length > 0) {
       return this.buildFromEntries({ ...opts, entries });
@@ -130,53 +139,42 @@ export class Builder {
     spinner.start('Building per-route serverless functions...');
 
     const externals = externalPackages ?? [];
-    const routeGroups = this.groupRoutes(capabilities.routes, routePrefixDepth ?? 1);
+    // app.use() mounts are kept in the manifest for analysis display, but they
+    // are middleware/sub-router mounts, not routable endpoints — grouping them
+    // would create bogus per-route functions.
+    const routableRoutes = capabilities.routes.filter((r) => r.method !== 'USE');
+    const routeGroups = this.groupRoutes(routableRoutes, routePrefixDepth ?? 1);
     const functions: FunctionArtifact[] = [];
     const tempDir = path.join(opts.outputDir, '.tmp-build');
     await fs.ensureDir(tempDir);
 
     try {
+      // Every route group runs the same whole-app wrapper, so bundle and zip
+      // once and point all functions at the same artifact.
+      const entryAbsolute = path.resolve(projectPath, capabilities.entryFile);
+      const wrapperPath = path.join(tempDir, 'app-entry.cjs');
+      const distPath = path.join(tempDir, 'app-bundle.cjs');
+      const zipPath = path.join(artifactsDir, 'app.zip');
+
+      const wrapperCode = this.generateFunctionWrapper(entryAbsolute.replace(/\\/g, '/'));
+      await fs.writeFile(wrapperPath, wrapperCode);
+      await this.bundleAndZip({ entryPoint: wrapperPath, distPath, zipPath, externals, projectPath });
+
+      const zipKey = `functions/${path.basename(zipPath)}`;
+      const sha256 = await this.hashFile(zipPath);
+
       for (const group of routeGroups) {
         const funcName = this.slugify(group.prefix);
-        const wrapperPath = path.join(tempDir, `${funcName}-entry.cjs`);
-        const distPath = path.join(tempDir, `${funcName}-bundle.cjs`);
-        const zipPath = path.join(artifactsDir, `${funcName}.zip`);
-
-        // Resolve entry file relative to project
-        const entryRelative = capabilities.entryFile;
-        const entryAbsolute = path.resolve(projectPath, entryRelative);
-        const entryForWrapper = entryAbsolute.replace(/\\/g, '/');
-
-        const wrapperCode = this.generateFunctionWrapper(entryForWrapper);
-        await fs.writeFile(wrapperPath, wrapperCode);
-
-        await esbuild.build({
-          entryPoints: [wrapperPath],
-          bundle: true,
-          platform: 'node',
-          target: 'node20',
-          format: 'cjs',
-          outfile: distPath,
-          minify: true,
-          treeShaking: true,
-          logLevel: 'warning',
-          external: externals,
-        });
-
-        if (externals.length > 0) {
-          await this.zipBundleWithNodeModules(distPath, projectPath, externals, zipPath);
-        } else {
-          await this.zipFile(distPath, zipPath, 'index.js');
-        }
 
         functions.push({
           name: funcName,
-          zipPath: path.relative(opts.outputDir, zipPath),
+          zipPath: zipKey,
+          sha256,
           entry: 'index.handler',
           routes: group.routes.map((r) => r.path),
           memory: 256,
           timeout: 30,
-          env: { NODE_ENV: 'production' },
+          env: { NODE_ENV: 'production', ...envVars },
         });
 
         if (verbose) {
@@ -222,10 +220,11 @@ export class Builder {
     appName: string;
     region: string;
     externalPackages?: string[];
+    envVars?: Record<string, string>;
     verbose?: boolean;
     spinner: ReturnType<typeof ora>;
   }): Promise<DeployManifest> {
-    const { projectPath, outputDir, artifactsDir, capabilities, buildId, appName, region, externalPackages, verbose, spinner } = opts;
+    const { projectPath, outputDir, artifactsDir, capabilities, buildId, appName, region, externalPackages, envVars, spinner } = opts;
 
     spinner.start('Bundling Express app (single function)...');
 
@@ -244,25 +243,7 @@ export class Builder {
     try {
       const wrapperCode = this.generateFunctionWrapper(entryForWrapper);
       await fs.writeFile(wrapperPath, wrapperCode);
-
-      await esbuild.build({
-        entryPoints: [wrapperPath],
-        bundle: true,
-        platform: 'node',
-        target: 'node20',
-        format: 'cjs',
-        outfile: distPath,
-        minify: true,
-        treeShaking: true,
-        logLevel: 'warning',
-        external: externals,
-      });
-
-      if (externals.length > 0) {
-        await this.zipBundleWithNodeModules(distPath, projectPath, externals, zipPath);
-      } else {
-        await this.zipFile(distPath, zipPath, 'index.js');
-      }
+      await this.bundleAndZip({ entryPoint: wrapperPath, distPath, zipPath, externals, projectPath });
     } finally {
       await fs.remove(tempDir);
     }
@@ -275,11 +256,12 @@ export class Builder {
 
     const funcArtifact: FunctionArtifact = {
       name: 'app',
-      zipPath: path.relative(outputDir, zipPath),
+      zipPath: `functions/${path.basename(zipPath)}`,
+      sha256: await this.hashFile(zipPath),
       entry: 'index.handler',
       memory: 256,
       timeout: 30,
-      env: { NODE_ENV: 'production' },
+      env: { NODE_ENV: 'production', ...envVars },
     };
 
     return {
@@ -311,10 +293,11 @@ export class Builder {
     appName: string;
     region: string;
     externalPackages?: string[];
+    envVars?: Record<string, string>;
     verbose?: boolean;
     spinner: ReturnType<typeof ora>;
   }): Promise<DeployManifest> {
-    const { projectPath, artifactsDir, entries, buildId, appName, region, externalPackages, verbose, spinner } = opts;
+    const { projectPath, artifactsDir, entries, buildId, appName, region, externalPackages, envVars, verbose, spinner } = opts;
 
     spinner.start('Building native serverless handlers...');
 
@@ -329,32 +312,16 @@ export class Builder {
         const distPath = path.join(tempDir, `${name}-bundle.cjs`);
         const zipPath = path.join(artifactsDir, `${name}.zip`);
 
-        await esbuild.build({
-          entryPoints: [entryAbsolute],
-          bundle: true,
-          platform: 'node',
-          target: 'node20',
-          format: 'cjs',
-          outfile: distPath,
-          minify: true,
-          treeShaking: true,
-          logLevel: 'warning',
-          external: externals,
-        });
-
-        if (externals.length > 0) {
-          await this.zipBundleWithNodeModules(distPath, projectPath, externals, zipPath);
-        } else {
-          await this.zipFile(distPath, zipPath, 'index.js');
-        }
+        await this.bundleAndZip({ entryPoint: entryAbsolute, distPath, zipPath, externals, projectPath });
 
         functions.push({
           name,
-          zipPath: path.relative(opts.outputDir, zipPath),
+          zipPath: `functions/${path.basename(zipPath)}`,
+          sha256: await this.hashFile(zipPath),
           entry: 'index.handler',
           memory: 256,
           timeout: 30,
-          env: { NODE_ENV: 'production' },
+          env: { NODE_ENV: 'production', ...envVars },
         });
 
         if (verbose) {
@@ -366,6 +333,11 @@ export class Builder {
     }
 
     spinner.succeed(`Built ${functions.length} native handlers`);
+
+    // Generate OpenAPI spec (catch-all to the last function; entries carry no
+    // route metadata) so the API gateway template has a spec to render.
+    const openApiPath = path.join(artifactsDir, 'openapi.json');
+    await this.generateOpenApiPerRoute(functions, openApiPath);
 
     return {
       schemaVersion: '1.0',
@@ -379,7 +351,10 @@ export class Builder {
         routing: 'per-route',
         region,
       },
-      artifacts: { functions },
+      artifacts: {
+        functions,
+        openApiPath: path.relative(opts.outputDir, openApiPath),
+      },
     };
   }
 
@@ -393,10 +368,11 @@ export class Builder {
     appName: string;
     region: string;
     registryId?: string;
+    envVars?: Record<string, string>;
     verbose?: boolean;
     spinner: ReturnType<typeof ora>;
   }): Promise<DeployManifest> {
-    const { projectPath, capabilities, containerTarget, buildId, appName, region, registryId, verbose, spinner } = opts;
+    const { projectPath, outputDir, capabilities, containerTarget, buildId, appName, region, registryId, envVars, verbose, spinner } = opts;
 
     // Ensure a Dockerfile exists
     const dockerfilePath = path.join(projectPath, 'Dockerfile');
@@ -407,6 +383,30 @@ export class Builder {
       spinner.succeed('Dockerfile generated');
       if (verbose) {
         console.log(chalk.gray(`  Dockerfile written to: ${dockerfilePath}`));
+      }
+      // The generated Dockerfile uses `COPY . .` with the project root as build
+      // context; without a .dockerignore that would pull node_modules (and the
+      // build output) into the image. Generate one alongside, if missing.
+      const dockerignorePath = path.join(projectPath, '.dockerignore');
+      if (!(await fs.pathExists(dockerignorePath))) {
+        const outputRelative = path.relative(projectPath, outputDir);
+        const ignoreEntries = [
+          'node_modules',
+          '.git',
+          'Dockerfile',
+          '.dockerignore',
+          '*.log',
+          // Ignore the build output dir when it lives inside the project.
+          ...(outputRelative && !outputRelative.startsWith('..') && !path.isAbsolute(outputRelative)
+            ? [outputRelative]
+            : []),
+        ];
+        await fs.writeFile(dockerignorePath, ignoreEntries.join('\n') + '\n');
+        console.log(
+          chalk.yellow(
+            `  Generated Dockerfile and .dockerignore in ${projectPath} (review and commit them, or add your own)`,
+          ),
+        );
       }
     } else {
       if (verbose) {
@@ -451,16 +451,31 @@ export class Builder {
           port: capabilities.port,
           memory: 256,
           concurrency: 10,
-          env: { NODE_ENV: 'production' },
+          env: { NODE_ENV: 'production', ...envVars },
         },
       },
     };
   }
 
+  private resolveRuntimeModule(): string {
+    // Resolve the runtime package from the CLI's own installation, NOT from the
+    // user's project — the user does not need to depend on it. esbuild bundles
+    // the resolved file (and its serverless-http dependency) into the artifact.
+    const requireFromCli = createRequire(import.meta.url);
+    try {
+      return requireFromCli.resolve('@yc-tools/express-yc-runtime');
+    } catch {
+      throw new Error(
+        'Could not resolve @yc-tools/express-yc-runtime from the CLI installation. Reinstall @yc-tools/express-yc.',
+      );
+    }
+  }
+
   private generateFunctionWrapper(entryAbsolutePath: string): string {
+    const runtimePath = this.resolveRuntimeModule().replace(/\\/g, '/');
     return `
 'use strict';
-const serverlessHttp = require('serverless-http');
+const { createFunctionHandler } = require(${JSON.stringify(runtimePath)});
 let _handler;
 
 async function getHandler() {
@@ -468,7 +483,7 @@ async function getHandler() {
   // Try default export, then named exports
   const mod = require(${JSON.stringify(entryAbsolutePath)});
   const app = mod.default || mod.app || mod;
-  _handler = serverlessHttp(app);
+  _handler = createFunctionHandler(app);
   return _handler;
 }
 
@@ -534,7 +549,42 @@ exports.handler = async (event, context) => {
   }
 
   private slugify(prefix: string): string {
-    return prefix.replace(/^\//, '').replace(/[^a-z0-9]+/gi, '-') || 'root';
+    return prefix.toLowerCase().replace(/^\//, '').replace(/[^a-z0-9]+/g, '-') || 'root';
+  }
+
+  private async bundleAndZip(opts: {
+    entryPoint: string;
+    distPath: string;
+    zipPath: string;
+    externals: string[];
+    projectPath: string;
+  }): Promise<void> {
+    const { entryPoint, distPath, zipPath, externals, projectPath } = opts;
+
+    await esbuild.build({
+      entryPoints: [entryPoint],
+      bundle: true,
+      platform: 'node',
+      target: 'node20',
+      format: 'cjs',
+      outfile: distPath,
+      minify: true,
+      treeShaking: true,
+      logLevel: 'warning',
+      external: externals,
+    });
+
+    if (externals.length > 0) {
+      await this.zipBundleWithNodeModules(distPath, projectPath, externals, zipPath);
+    } else {
+      await this.zipFile(distPath, zipPath, 'index.js');
+    }
+  }
+
+  private async hashFile(filePath: string): Promise<string> {
+    const hash = createHash('sha256');
+    hash.update(await fs.readFile(filePath));
+    return hash.digest('hex');
   }
 
   private async zipFile(sourcePath: string, destZip: string, entryName: string): Promise<void> {
@@ -543,11 +593,12 @@ exports.handler = async (event, context) => {
       const archive = archiver('zip', { zlib: { level: 9 } });
 
       output.on('close', resolve);
+      output.on('error', reject);
       archive.on('error', reject);
 
       archive.pipe(output);
       archive.file(sourcePath, { name: entryName });
-      void archive.finalize();
+      archive.finalize().catch(reject);
     });
   }
 
@@ -557,22 +608,37 @@ exports.handler = async (event, context) => {
     externals: string[],
     destZip: string,
   ): Promise<void> {
+    // Note: only the listed external packages are copied — their transitive
+    // dependencies are NOT included and must be listed explicitly if needed.
+    const externalDirs: Array<{ pkg: string; dir: string }> = [];
+    for (const pkg of externals) {
+      const pkgDir = path.join(projectPath, 'node_modules', pkg);
+      if (!(await fs.pathExists(pkgDir))) {
+        throw new Error(
+          `External package "${pkg}" not found in ${path.join(projectPath, 'node_modules')}. Install it in the project before building.`,
+        );
+      }
+      // pnpm layouts symlink packages into node_modules; archive the real
+      // directory so actual contents (not the symlink) end up in the zip.
+      externalDirs.push({ pkg, dir: await fs.realpath(pkgDir) });
+    }
+
     await new Promise<void>((resolve, reject) => {
       const output = fs.createWriteStream(destZip);
       const archive = archiver('zip', { zlib: { level: 9 } });
 
       output.on('close', resolve);
+      output.on('error', reject);
       archive.on('error', reject);
 
       archive.pipe(output);
       archive.file(bundlePath, { name: 'index.js' });
 
-      for (const pkg of externals) {
-        const pkgDir = path.join(projectPath, 'node_modules', pkg);
-        archive.directory(pkgDir, `node_modules/${pkg}`);
+      for (const { pkg, dir } of externalDirs) {
+        archive.directory(dir, `node_modules/${pkg}`);
       }
 
-      void archive.finalize();
+      archive.finalize().catch(reject);
     });
   }
 
@@ -616,6 +682,11 @@ exports.handler = async (event, context) => {
   ): Promise<void> {
     const paths: Record<string, unknown> = {};
 
+    // Placeholder names must be valid terraform templatefile() variable names;
+    // hyphens in function names are mapped to underscores. The terraform
+    // template feeds `function_id_<name with - replaced by _>` per function.
+    const functionIdVar = (name: string): string => `function_id_${name.replace(/-/g, '_')}`;
+
     for (const func of functions) {
       for (const routePath of func.routes || []) {
         const normalizedPath = routePath.replace(/:([^/]+)/g, '{$1}');
@@ -624,7 +695,7 @@ exports.handler = async (event, context) => {
             operationId: `${func.name}_${normalizedPath.replace(/\//g, '_').replace(/[{}]/g, '')}`,
             'x-yc-apigateway-integration': {
               type: 'cloud_functions',
-              function_id: `\${function_id_${func.name}}`,
+              function_id: `\${${functionIdVar(func.name)}}`,
               service_account_id: '${service_account_id}',
               payload_format_version: '1.0',
             },
@@ -642,7 +713,7 @@ exports.handler = async (event, context) => {
           parameters: [{ name: 'proxy', in: 'path', required: true, schema: { type: 'string' } }],
           'x-yc-apigateway-integration': {
             type: 'cloud_functions',
-            function_id: `\${function_id_${lastFunc.name}}`,
+            function_id: `\${${functionIdVar(lastFunc.name)}}`,
             service_account_id: '${service_account_id}',
             payload_format_version: '1.0',
           },
@@ -671,8 +742,12 @@ exports.handler = async (event, context) => {
         stdio: verbose ? 'inherit' : 'pipe',
       });
 
+      let stdout = '';
       let stderr = '';
       if (!verbose) {
+        child.stdout?.on('data', (chunk: Buffer) => {
+          stdout += chunk.toString();
+        });
         child.stderr?.on('data', (chunk: Buffer) => {
           stderr += chunk.toString();
         });
@@ -683,7 +758,8 @@ exports.handler = async (event, context) => {
         if (code === 0) {
           resolve();
         } else {
-          reject(new Error(`Command "${cmd} ${args.join(' ')}" failed (${code})\n${stderr}`));
+          const detail = [stderr.trim(), stdout.trim()].filter(Boolean).join('\n');
+          reject(new Error(`Command "${cmd} ${args.join(' ')}" failed (${code})\n${detail}`));
         }
       });
     });

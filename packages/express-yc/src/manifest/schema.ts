@@ -18,7 +18,10 @@ export const CapabilitiesSchema = z.object({
 
 export const FunctionArtifactSchema = z.object({
   name: z.string(),
+  /** Object Storage key of the function zip (also used by the uploader and terraform). */
   zipPath: z.string(),
+  /** sha256 of the zip contents; used as terraform user_hash to roll new versions. */
+  sha256: z.string(),
   entry: z.string(),
   routes: z.array(z.string()).optional(),
   memory: z.number().default(256),
@@ -60,5 +63,6 @@ export const DeployManifestSchema = z.object({
 
 export type DeployManifest = z.infer<typeof DeployManifestSchema>;
 export type Capabilities = z.infer<typeof CapabilitiesSchema>;
+export type RouteInfo = z.infer<typeof RouteInfoSchema>;
 export type FunctionArtifact = z.infer<typeof FunctionArtifactSchema>;
 export type ContainerArtifact = z.infer<typeof ContainerArtifactSchema>;
