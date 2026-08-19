@@ -23,7 +23,7 @@ export const FunctionArtifactSchema = z.object({
   routes: z.array(z.string()).optional(),
   memory: z.number().default(256),
   timeout: z.number().default(30),
-  env: z.record(z.string()).optional(),
+  env: z.record(z.string(), z.string()).optional(),
 });
 
 export const ContainerArtifactSchema = z.object({
@@ -32,7 +32,7 @@ export const ContainerArtifactSchema = z.object({
   port: z.number(),
   memory: z.number().default(256),
   concurrency: z.number().default(10),
-  env: z.record(z.string()).optional(),
+  env: z.record(z.string(), z.string()).optional(),
 });
 
 export const DeployManifestSchema = z.object({
