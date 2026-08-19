@@ -52,11 +52,14 @@ resource "yandex_function" "app" {
   memory            = var.function_memory
   execution_timeout = tostring(var.function_timeout)
 
-  user_hash = try(local.functions[0].zipPath, "")
+  # sha256 of the zip contents — changes whenever the artifact changes, so a
+  # new function version is rolled on every redeploy with new code.
+  user_hash = try(local.functions[0].sha256, "unknown")
 
   package {
     bucket_name = yandex_storage_bucket.deploy.bucket
-    object_name = "functions/${try(local.functions[0].zipPath, "function.zip")}"
+    # zipPath in the manifest is the object key used by the uploader.
+    object_name = try(local.functions[0].zipPath, "functions/function.zip")
   }
 
   service_account_id = yandex_iam_service_account.functions_sa.id
@@ -85,11 +88,13 @@ resource "yandex_function" "route" {
   memory            = try(each.value.memory, var.function_memory)
   execution_timeout = tostring(try(each.value.timeout, var.function_timeout))
 
-  user_hash = each.value.zipPath
+  # sha256 of the zip contents — changes whenever the artifact changes.
+  user_hash = each.value.sha256
 
   package {
     bucket_name = yandex_storage_bucket.deploy.bucket
-    object_name = "functions/${each.value.zipPath}"
+    # zipPath in the manifest is the object key used by the uploader.
+    object_name = each.value.zipPath
   }
 
   service_account_id = yandex_iam_service_account.functions_sa.id
@@ -111,7 +116,12 @@ locals {
   openapi_spec = local.routing == "single" ? templatefile("${var.build_dir}/artifacts/openapi.json", {
     function_id        = local.single_function_id
     service_account_id = yandex_iam_service_account.functions_sa.id
-  }) : jsonencode(jsondecode(file("${var.build_dir}/artifacts/openapi.json")))
+  }) : templatefile("${var.build_dir}/artifacts/openapi.json", merge(
+    { service_account_id = yandex_iam_service_account.functions_sa.id },
+    # The generated spec references ${function_id_<name>} with hyphens in the
+    # function name replaced by underscores (valid templatefile variable names).
+    { for name, fn in yandex_function.route : "function_id_${replace(name, "-", "_")}" => fn.id },
+  ))
 }
 
 resource "yandex_api_gateway" "main" {
