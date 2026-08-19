@@ -3,6 +3,7 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import path from 'path';
+import { createRequire } from 'module';
 import { Analyzer } from './analyze/index.js';
 import { Builder } from './build/index.js';
 import { Uploader } from './upload/index.js';
@@ -26,12 +27,15 @@ import {
 } from './config/index.js';
 import type { DeploymentMode, RoutingMode, ContainerTarget } from './build/index.js';
 
+const cliRequire = createRequire(import.meta.url);
+const { version: CLI_VERSION } = cliRequire('../package.json') as { version: string };
+
 const program = new Command();
 
 program
   .name('express-yc')
   .description('CLI tool for deploying Express.js applications to Yandex Cloud')
-  .version('1.0.2');
+  .version(CLI_VERSION);
 
 const DEPLOYMENT_MODES: readonly DeploymentMode[] = ['serverless', 'container'];
 const ROUTING_MODES: readonly RoutingMode[] = ['single', 'per-route'];
@@ -757,8 +761,9 @@ program
     }
   });
 
-program.parse(process.argv);
-
 if (!process.argv.slice(2).length) {
   program.outputHelp();
+  process.exit(1);
 }
+
+await program.parseAsync(process.argv);
