@@ -2,22 +2,12 @@ import fs from 'fs-extra';
 import path from 'path';
 import chalk from 'chalk';
 import { glob } from 'glob';
+import type { Capabilities, RouteInfo } from '../manifest/schema.js';
 
-export interface RouteInfo {
-  method: string;
-  path: string;
-}
+export type { RouteInfo };
 
-export interface ExpressCapabilities {
-  expressVersion: string;
-  isTypeScript: boolean;
-  entryFile: string;
-  routes: RouteInfo[];
-  hasStaticFiles: boolean;
-  staticDir?: string;
-  dependencies: string[];
-  port: number;
-}
+// Single source of truth: inferred from the zod CapabilitiesSchema in manifest/schema.ts.
+export type ExpressCapabilities = Capabilities;
 
 export interface AnalyzeOptions {
   projectPath: string;
